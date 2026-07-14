@@ -6,7 +6,7 @@ from convex_solver_base.optim_base import SingleDirectSolveProblem, BatchParalle
     SingleProblem, BatchParallelProblem, SingleUnconstrainedProblem, BatchParallelUnconstrainedProblem
 from convex_solver_base.direct_optim import batch_parallel_direct_solve, single_direct_solve
 from convex_solver_base.unconstrained_optim import single_unconstrained_solve, FistaSolverParams, \
-    batch_parallel_unconstrained_solve
+    LevenbergMarquardtSolverParams, batch_parallel_unconstrained_solve
 
 from abc import ABCMeta, abstractmethod
 from typing import Callable, Union, Tuple, Iterator, Optional, List, Any
@@ -174,6 +174,34 @@ class DirectSolve_HQS_ZGenerator:
         return single_direct_solve
 
 
+class BatchParallel_LM_HQS_XGenerator:
+    """HQS X-step generator that uses Levenberg-Marquardt instead of FISTA."""
+
+    def __init__(self, solver_params: LevenbergMarquardtSolverParams, verbose_lm: bool = False):
+        self.solver_params = solver_params
+        self.verbose_lm = verbose_lm
+        self.iter_count = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> HQS_ParameterizedSolveFn:
+        params = self.solver_params
+        hqs_iter = self.iter_count
+        verbose_lm = self.verbose_lm
+        self.iter_count += 1
+
+        def applied_lm_solve(prob: BatchParallelUnconstrainedProblem,
+                              verbose: bool = False,
+                              **kwargs) -> torch.Tensor:
+            if verbose_lm:
+                print(f"[HQS X-step {hqs_iter}] rho={prob.rho:.4f}")
+            return batch_parallel_unconstrained_solve(
+                prob, params, verbose=verbose or verbose_lm, **kwargs)
+
+        return applied_lm_solve
+
+
 class BatchParallel_DirectSolve_HQS_ZGenerator:
     def __init__(self):
         pass
@@ -331,6 +359,21 @@ def scheduled_rho_fixed_lambda_single_hqs_solve(x_problem: Union[HQS_X_Problem, 
             intermediates_list.append((x_problem.get_reconstructed_image(), next_z.detach().cpu().numpy()))
 
         if verbose:
-            print(f"HQS iter {it}, xloss {loss_x_prob}, zloss {loss_z_prob}")
+            with torch.no_grad():
+                x_vals = x_problem.get_reconstructed_image()
+                z_vals = next_z
+                x_mean = x_vals.mean().item()
+                x_std  = x_vals.std().item()
+                z_mean = z_vals.mean().item()
+                z_std  = z_vals.std().item()
+                noise_sigma = fixed_prior_weight / rho_val
+                # split data loss from prox loss to see if encoder is helping
+                obs_scale = getattr(x_problem, 'obs_scale', 1.0)
+                enc_out = x_problem.encoder(x_vals).reshape(x_problem.batch_size, -1) / obs_scale
+                data_loss = 0.5 * ((x_problem.observations - enc_out) ** 2).sum(dim=1).mean().item()
+            print(f"HQS iter {it:2d} | rho={rho_val:.3f} | denoiser_sigma={noise_sigma:.4f} "
+                  f"| data_loss={data_loss:.4f} "
+                  f"| x: mean={x_mean:.3f} std={x_std:.4f} "
+                  f"| z: mean={z_mean:.3f} std={z_std:.4f}")
 
     return intermediates_list

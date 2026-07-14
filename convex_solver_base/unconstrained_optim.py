@@ -4,7 +4,8 @@ import numpy as np
 
 from typing import Tuple, List
 
-from convex_solver_base.optim_base import SingleUnconstrainedProblem, BatchParallelUnconstrainedProblem
+from convex_solver_base.optim_base import SingleUnconstrainedProblem, BatchParallelUnconstrainedProblem, \
+    BatchParallelGNProblem
 
 
 class UnconstrainedSolverParams:
@@ -37,6 +38,31 @@ class FistaSolverParams(UnconstrainedSolverParams):
         self.max_iter = max_iter
         self.converge_epsilon = converge_epsilon
         self.backtracking_beta = backtracking_beta
+
+
+class LevenbergMarquardtSolverParams(UnconstrainedSolverParams):
+
+    def __init__(self,
+                 initial_lambda: float = 1.0,
+                 lambda_up: float = 10.0,
+                 lambda_down: float = 0.1,
+                 lambda_min: float = 1e-7,
+                 lambda_max: float = 1e7,
+                 max_iter: int = 15,
+                 max_cg_iter: int = 20,
+                 cg_tol: float = 1e-3,
+                 gain_ratio_threshold: float = 0.1,
+                 converge_epsilon: float = 1e-6):
+        self.initial_lambda = initial_lambda
+        self.lambda_up = lambda_up
+        self.lambda_down = lambda_down
+        self.lambda_min = lambda_min
+        self.lambda_max = lambda_max
+        self.max_iter = max_iter
+        self.max_cg_iter = max_cg_iter
+        self.cg_tol = cg_tol
+        self.gain_ratio_threshold = gain_ratio_threshold
+        self.converge_epsilon = converge_epsilon
 
 
 def _single_armijo_backtracking_search(single_unc_problem: SingleUnconstrainedProblem,
@@ -557,6 +583,154 @@ def batch_parallel_fista_solve(batch_unc_problem: BatchParallelUnconstrainedProb
         return batch_unc_problem._eval_smooth_loss(*stepped_variables, **kwargs)
 
 
+def _cg_solve_single(matvec_fn, b: torch.Tensor, max_iter: int, tol: float) -> torch.Tensor:
+    """Conjugate gradient: find x minimizing 0.5 x^T A x - b^T x, i.e., solve Ax = b.
+
+    matvec_fn: callable (v,) -> Av, v shape (n,)
+    b: shape (n,) — right-hand side
+    """
+    x = torch.zeros_like(b)
+    r = b.clone()
+    p = r.clone()
+    rr = torch.dot(r, r)
+    b_norm = torch.sqrt(torch.dot(b, b)).item()
+    abs_tol = tol * b_norm + 1e-30
+
+    for _ in range(max_iter):
+        if rr.sqrt().item() < abs_tol:
+            break
+        Ap = matvec_fn(p)
+        pAp = torch.dot(p, Ap)
+        if pAp.item() < 1e-14:
+            break
+        alpha = rr / pAp
+        x = x + alpha * p
+        r = r - alpha * Ap
+        rr_new = torch.dot(r, r)
+        beta = rr_new / rr
+        p = r + beta * p
+        rr = rr_new
+
+    return x
+
+
+def batch_parallel_lm_solve(batch_gn_problem: BatchParallelGNProblem,
+                             initial_lambda: float,
+                             lambda_up: float,
+                             lambda_down: float,
+                             lambda_min: float,
+                             lambda_max: float,
+                             max_iter: int,
+                             max_cg_iter: int,
+                             cg_tol: float,
+                             gain_ratio_threshold: float,
+                             converge_epsilon: float,
+                             verbose: bool = False,
+                             **kwargs) -> torch.Tensor:
+    """Levenberg-Marquardt X-step solver using implicit Jacobian via CG.
+
+    Each outer LM iteration:
+      1. Computes gradient g = nabla f(x) via autograd.
+      2. For each image, solves (J^T J + (rho+lambda) I) delta = -g via CG,
+         where J^T J v is computed as one JVP followed by one VJP.
+      3. Evaluates f(x + delta); accepts/rejects per image and updates lambda.
+
+    The predicted decrease used for the gain ratio is -0.5 * g^T delta,
+    which equals the exact quadratic model decrease when CG converges fully.
+    """
+    n = batch_gn_problem.n_problems
+
+    x = batch_gn_problem._batch_flatten_variables(
+        batch_gn_problem.parameters(recurse=False)
+    ).detach().clone()
+
+    lambda_lm = x.new_full((n,), initial_lambda)
+
+    with torch.no_grad():
+        best_loss = batch_gn_problem._packed_eval_smooth_loss(x, **kwargs)
+    initial_loss = best_loss.clone()
+    best_x = x.clone()
+
+    total_accepted = x.new_zeros(n)  # counts accepted steps per image
+
+    for outer in range(max_iter):
+        current_loss, grad = batch_gn_problem._packed_loss_and_gradients(x, **kwargs)
+        x = x.detach()
+        grad = grad.detach()
+
+        grad_norms = torch.norm(grad, dim=1)
+        if torch.all(grad_norms < converge_epsilon):
+            break
+
+        # CG solve per image using the implicit GN Hessian
+        delta = torch.zeros_like(x)
+        for i in range(n):
+            if grad_norms[i].item() < converge_epsilon:
+                continue
+
+            b_i = -grad[i]
+            xi_slice = x[i:i+1].detach()
+            lam_i = lambda_lm[i].item()
+
+            def make_mv(xi_s, lam):
+                def mv(v):
+                    result = batch_gn_problem._gn_matvec(xi_s, v.unsqueeze(0), lam)
+                    return result[0]
+                return mv
+
+            delta[i] = _cg_solve_single(make_mv(xi_slice, lam_i), b_i, max_cg_iter, cg_tol)
+
+        # Evaluate candidate loss
+        x_new = (x + delta).detach()
+        with torch.no_grad():
+            loss_new = batch_gn_problem._packed_eval_smooth_loss(x_new, **kwargs)
+
+        # Gain ratio: actual vs predicted decrease
+        # predicted = -0.5 * g^T delta (exact when CG converges fully)
+        pred_dec = -0.5 * torch.sum(grad * delta, dim=1)
+        actual_dec = current_loss - loss_new
+
+        gain_ratio = actual_dec / (pred_dec.abs() + 1e-30)
+        accept = gain_ratio > gain_ratio_threshold
+
+        x = torch.where(accept.unsqueeze(1), x_new, x)
+        total_accepted += accept.float()
+        lambda_lm = torch.clamp(
+            torch.where(accept, lambda_lm * lambda_down, lambda_lm * lambda_up),
+            lambda_min, lambda_max,
+        )
+
+        with torch.no_grad():
+            current_eval = batch_gn_problem._packed_eval_smooth_loss(x, **kwargs)
+        improved = current_eval < best_loss
+        best_x = torch.where(improved.unsqueeze(1), x, best_x)
+        best_loss = torch.where(improved, current_eval, best_loss)
+
+        if verbose:
+            n_accept = accept.sum().item()
+            print(f"LM iter={outer}, mean_loss={best_loss.mean().item():.5f}, "
+                  f"lambda_mean={lambda_lm.mean().item():.3e}, "
+                  f"accepted={n_accept}/{n}\r", end='')
+
+    if verbose:
+        print()
+
+    # Warn about images where LM never accepted a single step
+    stuck = (total_accepted == 0)
+    if stuck.any():
+        n_stuck = stuck.sum().item()
+        loss_change = (best_loss - initial_loss).abs()
+        print(f"WARNING: LM accepted zero steps for {n_stuck}/{n} image(s). "
+              f"lambda_lm={lambda_lm[stuck].mean().item():.3e} (hit ceiling?). "
+              f"Try lowering initial_lambda or rho. "
+              f"Max |loss change|={loss_change.max().item():.2e}")
+
+    stepped_vars = batch_gn_problem._batch_unflatten_variables(best_x)
+    batch_gn_problem.assign_optimization_vars(*stepped_vars)
+    with torch.no_grad():
+        return batch_gn_problem._eval_smooth_loss(*stepped_vars, **kwargs)
+
+
 def batch_parallel_unconstrained_solve(batch_unc_problem: BatchParallelUnconstrainedProblem,
                                        solver_params: UnconstrainedSolverParams,
                                        verbose: bool = False,
@@ -582,6 +756,25 @@ def batch_parallel_unconstrained_solve(batch_unc_problem: BatchParallelUnconstra
             solver_params.max_iter,
             solver_params.converge_epsilon,
             solver_params.backtracking_beta,
+            verbose=verbose,
+            **kwargs
+        )
+
+    elif isinstance(solver_params, LevenbergMarquardtSolverParams):
+        if not isinstance(batch_unc_problem, BatchParallelGNProblem):
+            raise TypeError("LM solver requires the problem to implement BatchParallelGNProblem._gn_matvec")
+        return batch_parallel_lm_solve(
+            batch_unc_problem,
+            solver_params.initial_lambda,
+            solver_params.lambda_up,
+            solver_params.lambda_down,
+            solver_params.lambda_min,
+            solver_params.lambda_max,
+            solver_params.max_iter,
+            solver_params.max_cg_iter,
+            solver_params.cg_tol,
+            solver_params.gain_ratio_threshold,
+            solver_params.converge_epsilon,
             verbose=verbose,
             **kwargs
         )

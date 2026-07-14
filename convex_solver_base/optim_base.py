@@ -335,6 +335,25 @@ class BatchParallelProxProblem(nn.Module, _BatchSolverMixin, metaclass=ABCMeta):
         return loss_tensor, gradients_output
 
 
+class BatchParallelGNProblem(metaclass=ABCMeta):
+    """Mixin for batch-parallel problems that support Gauss-Newton / LM solves.
+
+    Requires implementing _gn_matvec, which computes the implicit Hessian-vector
+    product (J^T J + (rho + lambda_lm) I) v needed by CG-based LM inner solves.
+    """
+
+    @abstractmethod
+    def _gn_matvec(self, packed_vars: torch.Tensor, v: torch.Tensor, lambda_lm: float) -> torch.Tensor:
+        """Compute (J(x)^T J(x) + (rho + lambda_lm) I) v for each problem.
+
+        :param packed_vars: shape (n_problems, n_vars) — current linearization point
+        :param v: shape (n_problems, n_vars) — tangent vectors
+        :param lambda_lm: LM damping parameter (rho from the problem is added internally)
+        :return: shape (n_problems, n_vars)
+        """
+        raise NotImplementedError
+
+
 SingleProblem = Union[SingleDirectSolveProblem, SingleUnconstrainedProblem, SingleProxProblem]
 
 

@@ -27,17 +27,20 @@ class BatchLinearMeasurementProxProblem(BatchParallelUnconstrainedProblem, Batch
                  measurement_matrix: np.ndarray,
                  image_shape: Tuple[int, int],
                  rho: float,
+                 k : float,
                  dtype: torch.dtype = torch.float32):
         """
         :param batch: batch size
         :param measurement_matrix: shape (n_measurements, height*width)
         :param image_shape: (height, width)
         :param rho: initial HQS coupling parameter ρ
+        :param k: steepness of non-linearity after applying linear measurement
         """
         super().__init__()
 
         self.batch_size = batch
         self.rho = rho
+        self.k = k
         self.height, self.width = image_shape
         self.n_pixels = self.height * self.width
         n_measurements = measurement_matrix.shape[0]
@@ -95,7 +98,13 @@ class BatchLinearMeasurementProxProblem(BatchParallelUnconstrainedProblem, Batch
         batched_image_flat = batched_image.reshape(self.batch_size, -1)
 
         # Mx: (batch, n_measurements)
-        predicted = batched_image_flat @ self.measurement_matrix.T
+        predicted_linear = batched_image_flat @ self.measurement_matrix.T
+
+        # Apply forward non-linearity
+        if self.k > 0:
+            predicted = torch.tanh(self.k * predicted_linear) / np.tanh(self.k)
+        else:
+            predicted = predicted_linear
 
         # residual: (batch, n_measurements)
         residual = self.observations - predicted
@@ -110,18 +119,28 @@ class BatchLinearMeasurementProxProblem(BatchParallelUnconstrainedProblem, Batch
         return data_loss + prox_loss
 
     def _packed_gradients_only(self, packed_variables: torch.Tensor, **kwargs) -> torch.Tensor:
-        """Analytic gradient — avoids autograd overhead for this quadratic problem.
+        # Linear projection Mx
+        predicted_linear = packed_variables @ self.measurement_matrix.T
 
-        packed_variables: (batch, n_pixels)
-        returns:          (batch, n_pixels)
-        """
-        # M @ x: (batch, n_measurements)
-        Mx = packed_variables @ self.measurement_matrix.T
+        if self.k > 0:
+            tanh_ku = torch.tanh(self.k * predicted_linear)
+            tanh_k = np.tanh(self.k)
+            predicted = tanh_ku / tanh_k
+            
+            # Loss gradient with respect to predicted output: (predicted - observations)
+            residual = predicted - self.observations 
+            
+            # Chain rule: multiply by derivative of the sigmoid function
+            d_pred_d_linear = (self.k / tanh_k) * (1.0 - tanh_ku ** 2)
+            backprop_flux = residual * d_pred_d_linear
+            
+            # Backproject through measurement matrix M^T
+            data_grad = backprop_flux @ self.measurement_matrix
+        else:
+            # Standard linear gradient fallback
+            data_grad = (predicted_linear - self.observations) @ self.measurement_matrix
 
-        # M^T (Mx - y): (batch, n_pixels)
-        data_grad = (Mx - self.observations) @ self.measurement_matrix
-
-        # ρ (x - z): (batch, n_pixels)
+        # ρ (x - z)
         z_flat = self.z_const_tensor.reshape(self.batch_size, -1)
         prox_grad = self.rho * (packed_variables - z_flat)
 
